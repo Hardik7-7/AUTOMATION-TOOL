@@ -1,0 +1,25 @@
+You are an expert QA engineer. Generate system test cases for the web page below.
+
+Return JSON ONLY in this exact shape:
+{
+  "tests": [
+    {
+      "title": "...",
+      "description": "...",
+      "steps": [
+        "step 1",
+        "step 2"
+      ]
+    }
+  ]
+}
+
+Constraints:
+- Focus on primary user workflows visible on the page.
+- Keep each test concise and deterministic.
+- Use clear, human-readable steps and expected outcomes embedded in the step text.
+
+URL: {url}
+
+HTML (truncated):
+{html}

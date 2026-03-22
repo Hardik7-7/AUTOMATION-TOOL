@@ -1,0 +1,21 @@
+You are a senior QA automation engineer. Generate a Playwright sync Python script for the test case below.
+
+Requirements:
+- Use sync_playwright only.
+- Use Chromium.
+- Use simple selectors (text=, role=).
+- Add wait_for_selector where needed.
+- Wrap execution in try/except.
+- On failure, take a screenshot named "screenshot.png" in the current working directory.
+- Print clear step progress to stdout.
+- Ensure the script exits with non-zero code on failure.
+- The script must be runnable as `python test_x.py`.
+
+Test Title: {title}
+Test Description: {description}
+URL: {url}
+
+Test Steps:
+{steps}
+
+Return ONLY the Python code. No markdown.
