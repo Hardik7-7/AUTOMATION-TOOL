@@ -1,20 +1,21 @@
-venv/
+.\venv\
 __pycache__/
 *.pyc
 .env
 *.sqlite3
 
 # Ignore everything inside runtime
-/runtime/*
+# Runtime (inside backend)
+backend/runtime/*
 
-# But keep the folders
-!/runtime/screenshots/
-!/runtime/scripts/
+# Bring back folders
+!backend/runtime/screenshots/
+!backend/runtime/scripts/
 
-# Ignore everything inside those folders
-/runtime/screenshots/*
-/runtime/scripts/*
+# Ignore contents again
+backend/runtime/screenshots/*
+backend/runtime/scripts/*
 
-# Keep folder structure (empty dirs)
-!/runtime/screenshots/.gitkeep
-!/runtime/scripts/.gitkeep
+# Keep folder structure
+!backend/runtime/screenshots/.gitkeep
+!backend/runtime/scripts/.gitkeep
