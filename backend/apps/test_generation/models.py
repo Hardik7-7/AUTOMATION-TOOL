@@ -2,11 +2,23 @@ from django.db import models
 
 
 class TestCase(models.Model):
+    STATUS_DRAFT = "draft"
+    STATUS_APPROVED = "approved"
+    STATUS_REJECTED = "rejected"
+
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_APPROVED, "Approved"),
+        (STATUS_REJECTED, "Rejected"),
+    ]
+
     source_url = models.URLField(max_length=2048)
     title = models.CharField(max_length=255)
     description = models.TextField()
     steps_json = models.JSONField()
     steps_text = models.TextField(null=True, blank=True)
+    screenshots_json = models.JSONField(default=list, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
     raw_llm_output = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
 

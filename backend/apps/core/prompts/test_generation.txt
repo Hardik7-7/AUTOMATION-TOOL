@@ -1,4 +1,4 @@
-You are an expert QA engineer. Generate system test cases for the web page below.
+You are a QA architect. Generate human-readable system test descriptions for review.
 
 Return JSON ONLY in this exact shape:
 {
@@ -7,19 +7,27 @@ Return JSON ONLY in this exact shape:
       "title": "...",
       "description": "...",
       "steps": [
-        "step 1",
-        "step 2"
+        "step 1 with expected outcome",
+        "step 2 with expected outcome"
       ]
     }
   ]
 }
 
-Constraints:
-- Focus on primary user workflows visible on the page.
-- Keep each test concise and deterministic.
-- Use clear, human-readable steps and expected outcomes embedded in the step text.
+Rules:
+- Focus on user workflows and business value.
+- Steps must be readable by humans (not automation code).
+- Include expected outcomes directly in each step text.
+- Avoid guessing features that are not supported by the context.
 
-URL: {url}
+Product description:
+{product_description}
 
-HTML (truncated):
-{html}
+Key workflows to prioritize:
+{key_workflows}
+
+Starting URL:
+{url}
+
+Crawled pages (truncated HTML):
+{pages}

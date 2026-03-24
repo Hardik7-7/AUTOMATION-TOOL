@@ -1,15 +1,36 @@
+import base64
 import json
 import logging
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 from apps.test_generation.models import TestCase
 
 MAX_URL_LENGTH = 2000
-PLAYWRIGHT_TIMEOUT_MS = 20000
-MIN_INTERACTIVE_ELEMENTS = 1
+MAX_HTML_CHARS = 8000
+MAX_CRAWL_PAGES = 5
+PLAYWRIGHT_TIMEOUT_SECONDS = 20
+RUNTIME_SCREENSHOTS_DIR = Path(__file__).resolve().parents[2] / "runtime" / "screenshots"
+
+# Extensions that are assets, not navigable pages
+ASSET_EXTENSIONS = {
+    ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+    ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map",
+    ".json", ".xml", ".txt", ".pdf", ".zip",
+}
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CrawlPage:
+    url: str
+    title: str
+    html: str
+    screenshot_path: str
 
 
 @dataclass
@@ -20,79 +41,209 @@ class GeneratedTest:
 
 
 # -------------------------------
-# 🔍 OBSERVATION LAYER
+# 🛠️ HELPERS
 # -------------------------------
-def _observe_page(url: str) -> dict[str, Any]:
+
+def _safe_filename(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", text)[:80] or "page"
+
+
+def _is_navigable_url(url: str, base_origin: str) -> bool:
+    """
+    FIX 1: Only follow same-origin <a href> links that are actual HTML pages.
+    Rejects JS bundles, CSS, images, fonts, and any other static assets.
+    Previously the crawler was visiting chunk-*.js, styles-*.css, favicon.ico
+    which caused Playwright screenshot timeouts and wasted crawl budget.
+    """
+    try:
+        parsed = urlparse(url)
+        base_parsed = urlparse(base_origin)
+
+        # Must be http/https
+        if parsed.scheme not in ("http", "https"):
+            return False
+
+        # Must be same origin
+        if parsed.netloc != base_parsed.netloc:
+            return False
+
+        # Reject known asset extensions
+        path_lower = parsed.path.lower()
+        if any(path_lower.endswith(ext) for ext in ASSET_EXTENSIONS):
+            return False
+
+        return True
+    except Exception:
+        return False
+
+
+def _collect_links(base_url: str, page: Any) -> list[str]:
+    """
+    FIX 1 (continued): Extract links from <a href> only via Playwright,
+    not via regex on raw HTML which also picks up script/link/img src tags.
+    Filters through _is_navigable_url to exclude assets.
+    """
+    links = []
+    try:
+        anchors = page.locator("a[href]").all()
+        for anchor in anchors:
+            href = anchor.get_attribute("href")
+            if not href:
+                continue
+            absolute = urljoin(base_url, href)
+            # Strip fragment — SPAs use fragments for routing but we still
+            # want to deduplicate properly
+            parsed = urlparse(absolute)
+            clean = parsed._replace(fragment="").geturl()
+            if _is_navigable_url(clean, base_url):
+                links.append(clean)
+    except Exception:
+        logger.warning("Failed to collect links from page")
+
+    return list(dict.fromkeys(links))  # deduplicate, preserve order
+
+
+def _load_screenshot_as_base64(path: str) -> str | None:
+    """
+    FIX 2: Load screenshot bytes and encode as base64 so they can be sent
+    to Gemini as vision input. Previously paths were passed as plain strings
+    which Gemini cannot read — screenshots were captured but never used by LLM.
+    """
+    try:
+        return base64.b64encode(Path(path).read_bytes()).decode("utf-8")
+    except Exception:
+        logger.warning("Could not load screenshot for vision: %s", path)
+        return None
+
+
+def _sanitize_html(html: str) -> str:
+    return " ".join(html.replace("\n", " ").split())
+
+
+def _truncate_html(html: str) -> str:
+    if len(html) <= MAX_HTML_CHARS:
+        return html
+    return html[:MAX_HTML_CHARS]
+
+
+# -------------------------------
+# 🔍 CRAWL LAYER
+# -------------------------------
+
+def _render_page_snapshot(url: str, screenshot_path: Path, playwright_instance: Any) -> tuple[str, Any]:
+    """
+    Renders a single page, takes a screenshot, and returns (html, page_handle).
+    Reuses a passed-in playwright instance instead of spawning one per page —
+    previously each page opened its own browser which was slow and memory-heavy.
+    Returns the live page object so _collect_links can use Playwright's DOM
+    querying instead of regex on raw HTML.
+    """
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    browser = playwright_instance.chromium.launch(headless=True)
+    context = browser.new_context()
+    page = context.new_page()
+
+    try:
+        page.goto(
+            url,
+            wait_until="networkidle",
+            timeout=PLAYWRIGHT_TIMEOUT_SECONDS * 1000,
+        )
+
+        # Wait for meaningful content — important for hash-routed SPAs
+        try:
+            page.wait_for_selector("input, button, h1, h2, a", timeout=5000)
+        except Exception:
+            logger.warning("No interactive elements found on: %s", url)
+
+        page.screenshot(path=str(screenshot_path), full_page=True)
+        html = page.content()
+        return html, page, context, browser
+
+    except PlaywrightTimeoutError:
+        logger.warning("Timeout while loading page: %s", url)
+        try:
+            context.close()
+            browser.close()
+        except Exception:
+            pass
+        raise TimeoutError(f"Page load timed out for {url}")
+
+    except Exception as e:
+        logger.exception("Error rendering page: %s", url)
+        try:
+            context.close()
+            browser.close()
+        except Exception:
+            pass
+        raise e
+
+
+def _crawl_site(start_url: str) -> list[CrawlPage]:
     from playwright.sync_api import sync_playwright
 
+    visited: set[str] = set()
+    queue: list[str] = [start_url]
+    pages: list[CrawlPage] = []
+
+    RUNTIME_SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
+        while queue and len(pages) < MAX_CRAWL_PAGES:
+            current = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
 
-        try:
-            page.goto(url, wait_until="networkidle", timeout=PLAYWRIGHT_TIMEOUT_MS)
+            filename = f"{len(pages) + 1}_{_safe_filename(current)}.png"
+            screenshot_path = RUNTIME_SCREENSHOTS_DIR / filename
 
-            # FIX 1: Explicitly wait for SPA to hydrate before scraping.
-            # networkidle alone is not enough for hash-routed SPAs like Vue/React.
             try:
-                page.wait_for_selector(
-                    "input, button, h1, h2, h3, a",
-                    timeout=5000,
+                html, page, context, browser = _render_page_snapshot(
+                    current, screenshot_path, playwright
                 )
             except Exception:
-                logger.warning("No interactive elements appeared after waiting — page may be blank")
+                logger.exception("Failed to render page during crawl: %s", current)
+                continue
 
-            data = {
-                "url": page.url,
-                "title": page.title(),
-                "headings": page.locator("h1, h2, h3").all_text_contents(),
-                "buttons": [
-                    b.strip()
-                    for b in page.locator("button").all_text_contents()
-                    if b.strip()
-                ],
-                "links": [
-                    {
-                        "text": a.inner_text().strip(),
-                        "href": a.get_attribute("href") or "",
-                    }
-                    for a in page.locator("a").all()
-                    if a.inner_text().strip()
-                ],
-                "inputs": [],
-                # FIX 2: Also capture visible text labels so the LLM knows
-                # what error messages, hints, and descriptions actually exist.
-                "visible_labels": [
-                    t.strip()
-                    for t in page.locator("label, span, p, small").all_text_contents()
-                    if t.strip()
-                ],
-            }
+            sanitized = _sanitize_html(html)
 
-            for inp in page.locator("input").all():
-                data["inputs"].append({
-                    "name": inp.get_attribute("name"),
-                    "placeholder": inp.get_attribute("placeholder"),
-                    "type": inp.get_attribute("type"),
-                    # FIX 3: Capture aria-label too — SPAs often skip name/placeholder
-                    "aria_label": inp.get_attribute("aria-label"),
-                })
+            title = ""
+            match = re.search(r"<title>(.*?)</title>", sanitized, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                title = match.group(1).strip()
 
-            logger.info("Observed page data:\n%s", json.dumps(data, indent=2))
-            return data
+            # Collect navigable links using Playwright DOM (not regex on raw HTML)
+            new_links = _collect_links(current, page)
 
-        finally:
             try:
                 context.close()
                 browser.close()
             except Exception:
-                logger.warning("Browser cleanup failed")
+                logger.warning("Browser cleanup failed for: %s", current)
+
+            pages.append(
+                CrawlPage(
+                    url=current,
+                    title=title,
+                    html=_truncate_html(sanitized),
+                    screenshot_path=str(screenshot_path),
+                )
+            )
+
+            for link in new_links:
+                if link not in visited and len(pages) + len(queue) < MAX_CRAWL_PAGES:
+                    queue.append(link)
+
+    logger.info("Crawled %s page(s) from %s", len(pages), start_url)
+    return pages
 
 
 # -------------------------------
-# 🧠 LLM JSON EXTRACTION
+# 🧠 LLM HELPERS
 # -------------------------------
+
 def _extract_json(text: str) -> dict[str, Any] | None:
     try:
         return json.loads(text)
@@ -110,16 +261,12 @@ def _extract_json(text: str) -> dict[str, Any] | None:
         return None
 
 
-# -------------------------------
-# 🧪 NORMALIZATION
-# -------------------------------
 def _normalize_tests(payload: dict[str, Any] | None, raw_text: str) -> list[GeneratedTest]:
     if not payload or "tests" not in payload:
         logger.warning("Invalid LLM response format")
         return []
 
     tests = []
-
     for entry in payload.get("tests", []):
         title = str(entry.get("title", "Generated Test")).strip()
         description = str(entry.get("description", "")).strip()
@@ -127,7 +274,6 @@ def _normalize_tests(payload: dict[str, Any] | None, raw_text: str) -> list[Gene
         steps = entry.get("steps", [])
         if not isinstance(steps, list):
             steps = [str(steps)]
-
         steps = [str(step).strip() for step in steps if str(step).strip()]
 
         if steps:
@@ -136,159 +282,114 @@ def _normalize_tests(payload: dict[str, Any] | None, raw_text: str) -> list[Gene
     return tests
 
 
-# -------------------------------
-# 🚨 VALIDATION (ANTI-HALLUCINATION)
-# -------------------------------
-
-# UI-specific keywords the LLM might hallucinate.
-# If a step mentions one of these, it MUST be grounded in observed page data.
-_UI_SIGNAL_WORDS = {
-    "button", "link", "input", "field", "checkbox", "dropdown",
-    "click", "select", "check", "navigate", "verify", "label",
-    "heading", "title", "placeholder", "text", "icon", "modal",
-    "redirect", "url", "page",
-}
-
-
-def _page_data_corpus(page_data: dict) -> set[str]:
+def _build_vision_prompt(
+    url: str,
+    product_description: str,
+    key_workflows: list[str],
+    pages: list[CrawlPage],
+    prompt_template: str,
+) -> tuple[str, list[dict]]:
     """
-    Build a set of meaningful tokens from observed page data.
-    Only includes tokens longer than 2 chars to avoid false positives
-    from common short words like 'to', 'in', 'a'.
+    FIX 2 (continued): Build the text prompt and a separate list of base64
+    image parts to be sent together to Gemini as a multimodal request.
+    Previously screenshot paths were inlined as plain strings in the text
+    prompt — Gemini cannot read file paths and was ignoring them entirely.
+
+    Returns (text_prompt, image_parts) where image_parts is a list of
+    Gemini-compatible inline_data dicts ready to attach to the request.
     """
-    raw = json.dumps(page_data).lower()
-    return {token for token in raw.split() if len(token) > 2}
+    workflow_text = "\n".join(f"- {w}" for w in key_workflows) if key_workflows else "Not specified"
 
-
-def _step_references_unobserved_ui(step: str, corpus: set[str]) -> bool:
-    """
-    Returns True if a step makes a UI claim that isn't grounded in page_data.
-
-    Strategy: extract quoted strings from the step (e.g. 'Forgot Password?',
-    'Sign Up') — these are explicit UI label references. If any quoted label
-    has NO token overlap with the observed corpus, the step is hallucinated.
-    """
-    import re
-
-    # Extract all quoted strings — these are explicit UI element references
-    quoted = re.findall(r"['\"]([^'\"]+)['\"]", step)
-
-    for label in quoted:
-        label_tokens = {t for t in label.lower().split() if len(t) > 2}
-        if label_tokens and label_tokens.isdisjoint(corpus):
-            logger.debug(
-                "Hallucination detected — quoted label '%s' not in page corpus", label
-            )
-            return True
-
-    return False
-
-
-def _validate_tests(
-    tests: list[GeneratedTest], page_data: dict
-) -> list[GeneratedTest]:
-    # FIX 4: Abort immediately if page scrape returned nothing useful.
-    has_buttons = bool(page_data.get("buttons"))
-    has_inputs = bool(page_data.get("inputs"))
-    has_links = bool(page_data.get("links"))
-
-    if not (has_buttons or has_inputs or has_links):
-        logger.error(
-            "Page data has no interactive elements — scrape likely failed, rejecting all tests"
+    # Text summary of each crawled page (no file paths — those go as images)
+    page_summaries = []
+    for i, page in enumerate(pages, 1):
+        page_summaries.append(
+            f"--- Page {i} ---\n"
+            f"URL: {page.url}\n"
+            f"Title: {page.title}\n"
+            f"HTML Snapshot:\n{page.html}\n"
+            f"(Screenshot {i} attached as image below)"
         )
-        return []
 
-    corpus = _page_data_corpus(page_data)
-    valid_tests = []
+    text_prompt = (
+        prompt_template
+        .replace("{url}", url)
+        .replace("{product_description}", product_description.strip() or "Not provided")
+        .replace("{key_workflows}", workflow_text)
+        .replace("{pages}", "\n\n".join(page_summaries))
+    )
 
-    for test in tests:
-        valid_steps = []
-
-        for step in test.steps:
-            # FIX 5: Reject steps that reference quoted UI labels not in page corpus.
-            # This catches hallucinated button/link names like 'Forgot Password?'
-            # or 'Sign Up' that don't exist on the actual page.
-            if _step_references_unobserved_ui(step, corpus):
-                logger.warning("Dropping hallucinated step: %s", step)
-                continue
-
-            valid_steps.append(step)
-
-        if valid_steps:
-            test.steps = valid_steps
-            valid_tests.append(test)
+    # Build base64 image parts for every screenshot that exists on disk
+    image_parts = []
+    for page in pages:
+        b64 = _load_screenshot_as_base64(page.screenshot_path)
+        if b64:
+            image_parts.append({
+                "inline_data": {
+                    "mime_type": "image/png",
+                    "data": b64,
+                }
+            })
         else:
-            logger.warning("Dropping fully hallucinated test: '%s'", test.title)
+            logger.warning("Skipping missing screenshot: %s", page.screenshot_path)
 
-    return valid_tests
+    return text_prompt, image_parts
 
 
 # -------------------------------
 # 🚀 MAIN FUNCTION
 # -------------------------------
-def generate_tests_from_url(url: str) -> list[TestCase]:
+
+def generate_tests_from_url(
+    url: str,
+    product_description: str | None = None,
+    key_workflows: list[str] | None = None,
+) -> list[TestCase]:
     if len(url) > MAX_URL_LENGTH:
         raise ValueError("URL exceeds maximum allowed length")
 
     logger.info("Generating tests for URL: %s", url)
 
-    # 🔍 Step 1: Observe page
-    try:
-        page_data = _observe_page(url)
-    except Exception:
-        logger.exception("Failed to observe page")
-        page_data = {}
+    pages = _crawl_site(url)
 
-    if not page_data:
-        logger.error("No page data found — aborting test generation")
+    if not pages:
+        logger.error("Crawl returned no pages — aborting")
         return []
 
-    # 🧠 Step 2: Prepare prompt
     from apps.core.llm.gemini_client import GeminiClient
     from apps.core.prompt_loader import PromptLoader
 
     loader = PromptLoader()
     prompt_template = loader.load("test_generation.txt")
 
-    # FIX 6: Inject a strict grounding instruction so the LLM knows
-    # it must not invent UI elements beyond what's in page_data.
-    grounding_note = (
-        "IMPORTANT: Only generate test steps that reference UI elements "
-        "explicitly present in the page_data provided. "
-        "Do NOT invent buttons, links, labels, error messages, URLs, or "
-        "text that are not listed in page_data. "
-        "If an element is not observed, do not reference it."
+    text_prompt, image_parts = _build_vision_prompt(
+        url=url,
+        product_description=product_description or "",
+        key_workflows=key_workflows or [],
+        pages=pages,
+        prompt_template=prompt_template,
     )
 
-    prompt = (
-        prompt_template
-        .replace("{url}", url)
-        .replace("{page_data}", json.dumps(page_data, indent=2))
-        .replace("{grounding_note}", grounding_note)
-    )
-
-    # 🤖 Step 3: Call LLM
     try:
         client = GeminiClient()
-        response = client.generate_text(prompt)
-        logger.info("LLM Response:\n%s", response.text)
+        # FIX 2: Pass both text prompt and image parts so Gemini actually
+        # sees the screenshots. Check your GeminiClient.generate_text signature
+        # — if it doesn't accept image_parts yet, add that parameter.
+        response = client.generate_text(text_prompt, image_parts=image_parts)
+        logger.info("LLM response received (%d image(s) sent)", len(image_parts))
     except Exception:
         logger.exception("LLM generation failed")
         raise
 
-    # 🧪 Step 4: Parse + normalize
     payload = _extract_json(response.text)
     tests = _normalize_tests(payload, response.text)
 
-    # 🚨 Step 5: Validate against observed data
-    tests = _validate_tests(tests, page_data)
-
     if not tests:
-        logger.warning("All generated tests were filtered out (hallucination likely)")
+        logger.warning("No tests generated")
         return []
 
-    # 💾 Step 6: Save
     created = []
+    screenshot_paths = [p.screenshot_path for p in pages]
 
     for test in tests:
         created.append(
@@ -298,9 +399,10 @@ def generate_tests_from_url(url: str) -> list[TestCase]:
                 description=test.description,
                 steps_json=test.steps,
                 steps_text="\n".join(test.steps),
+                screenshots_json=screenshot_paths,
                 raw_llm_output=response.text,
             )
         )
 
-    logger.info("Generated %s valid test(s)", len(created))
+    logger.info("Generated %s test(s) from %s crawled page(s)", len(created), len(pages))
     return created

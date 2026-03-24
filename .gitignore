@@ -2,3 +2,18 @@ venv/
 __pycache__/
 *.pyc
 .env
+
+# Ignore everything inside runtime
+/runtime/*
+
+# But keep the folders
+!/runtime/screenshots/
+!/runtime/scripts/
+
+# Ignore everything inside those folders
+/runtime/screenshots/*
+/runtime/scripts/*
+
+# Keep folder structure (empty dirs)
+!/runtime/screenshots/.gitkeep
+!/runtime/scripts/.gitkeep

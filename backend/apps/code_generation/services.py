@@ -22,6 +22,8 @@ def _extract_python_code(text: str) -> str:
 
 def generate_script_for_test(test_id: int) -> TestScript:
     test_case = TestCase.objects.get(id=test_id)
+    if test_case.status != TestCase.STATUS_APPROVED:
+        raise ValueError("Test must be approved before code generation")
 
     loader = PromptLoader()
     prompt_template = loader.load("code_generation.txt")

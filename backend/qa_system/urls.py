@@ -22,4 +22,5 @@ urlpatterns = [
     path('', include('apps.core.urls')),
     path('', include('apps.code_generation.urls')),
     path('', include('apps.test_generation.urls')),
+    path('', include('apps.test_runner.urls')),
 ]

@@ -41,6 +41,7 @@ INSTALLED_APPS = [
     'apps.core',
     'apps.code_generation',
     'apps.test_generation',
+    'apps.test_runner',
 ]
 
 MIDDLEWARE = [
