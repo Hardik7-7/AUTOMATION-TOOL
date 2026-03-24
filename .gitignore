@@ -6,6 +6,8 @@
 .env
 *.sqlite3
 
+backend/db.sqlite3
+
 # Ignore everything inside runtime
 # Runtime (inside backend)
 backend/runtime/*
