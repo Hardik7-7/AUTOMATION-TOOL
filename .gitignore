@@ -1,5 +1,7 @@
-.\venv\
-__pycache__/
+# Virtual environments
+.venv/
+.venv/__pycache__/
+
 *.pyc
 .env
 *.sqlite3
